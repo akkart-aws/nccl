@@ -42,8 +42,10 @@ getDevHandle(ncclGinCtx ctx) {
 
 template <ncclGinResourceSharingMode mode>
 static constexpr cuda::thread_scope ncclGinScope =
-    (mode == NCCL_GIN_RESOURCE_SHARING_CTA)
-        ? cuda::thread_scope_block : cuda::thread_scope_device;
+    (mode == NCCL_GIN_RESOURCE_SHARING_THREAD)
+        ? cuda::thread_scope_thread
+        : ((mode == NCCL_GIN_RESOURCE_SHARING_CTA)
+               ? cuda::thread_scope_block : cuda::thread_scope_device);
 
 /* The EFA hardware completion counters (FI_WRITE / FI_REMOTE_WRITE) wrap at
  * 2^31, while the kernel-side producer cursors are uint32 (wrap at 2^32).
@@ -95,7 +97,7 @@ template <ncclGinResourceSharingMode mode>
 NCCL_DEVICE_INLINE static void postRdmaWrite(
     nccl_ofi_gin_gdaki_dev_endpoint_handle *ep, uint16_t ah, uint16_t qpn,
     uint32_t qkey, uint64_t srcAddr, uint32_t srcLkey, uint32_t writeBytes,
-    uint64_t dstAddr, uint32_t dstRkey) {
+    uint64_t dstAddr, uint32_t dstRkey, uint32_t optFlags = ncclGinOptFlagsDefault) {
 
   efa_cuda_qp       *qp                  = (efa_cuda_qp *)ep->qp;
   uint64_t          *submitted_count_ptr  = &ep->submitted_count;
@@ -106,6 +108,64 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(
   efa_cuda_init_rdma_write_wr(&wr, (uint16_t)threadIdx.x, dstRkey, dstAddr);
   efa_cuda_wr_set_sge(&wr, srcLkey, srcAddr, writeBytes);
   efa_cuda_wr_set_remote(&wr, ah, (uint32_t)qpn, qkey);
+
+  /* THREAD resource-sharing fast path: the QP has exactly one posting
+   * thread (no sharing across lanes/warps/CTAs), so the cross-poster
+   * coalescing machinery below is unnecessary. With a single writer we
+   * can also honor ncclGinOptFlagsAggregateRequests by deferring the
+   * doorbell across consecutive posts and ringing once for the batch.
+   *
+   * Cursor reuse (no new struct fields, ABI unchanged):
+   *   pc             : next slot to write (plain ++, single writer).
+   *   wqes_completed : "last rung" — the doorbell value last written.
+   *   pending        : pc - wqes_completed = WQEs written but not yet
+   *                    doorbelled.
+   *
+   * The doorbell is rung when the caller did NOT request aggregation, or
+   * when the deferred batch reaches the EFA staging limit (max_batch);
+   * otherwise the WQE is left written-but-un-rung and a later non-
+   * aggregated post (or Flush) rings past it (the doorbell is monotonic,
+   * so one ring drains the whole contiguous batch). submitted_count is
+   * advanced only at ring time so Flush's completion wait stays exact. */
+  if (mode == NCCL_GIN_RESOURCE_SHARING_THREAD) {
+    const bool aggregate = (optFlags & ncclGinOptFlagsAggregateRequests) != 0;
+    const uint32_t max_batch = qp->sq.wq.max_batch;
+
+    /* Reserve one slot (single writer, no atomics needed). */
+    uint32_t slot = qp->sq.wq.pc;
+    qp->sq.wq.pc = slot + 1u;
+
+    /* SQ ring-overflow backpressure: same 31-bit modular check as the
+     * shared path, on this slot's high-water mark. */
+    while (((slot + 1u - (uint32_t)hwCounterLoad(local_cntr_ptr)) & EFA_CNTR_MASK) > sq_size_val) {
+      /* spin */
+    }
+
+    /* Write the WQE into its slot. */
+    uint32_t sq_idx   = slot & qp->sq.wq.queue_mask;
+    int      wqe_phase = (int)((slot >> qp->sq.wq.queue_size_shift) & 1u);
+    EFA_SET(&wr.meta.ctrl2, EFA_IO_TX_META_DESC_PHASE, wqe_phase);
+    {
+      uint64_t *src = (uint64_t *)&wr;
+      uint64_t *dst = (uint64_t *)(qp->sq.wq.buf + sq_idx * sizeof(efa_io_tx_wqe));
+      for (int i = 0; i < 8; i++)
+        dst[i] = src[i];
+    }
+    __threadfence_system();   /* publish the WQE before any doorbell */
+
+    /* Doorbell decision: ring unless aggregating, and force a ring once
+     * the deferred batch hits the EFA staging limit. */
+    uint32_t pending  = slot + 1u - qp->sq.wq.wqes_completed;
+    bool     must_ring = (!aggregate) || (pending >= max_batch);
+    if (must_ring) {
+      *qp->sq.wq.db = slot + 1u;
+      __threadfence_system();   /* order the doorbell write */
+      scopedAtomicAdd<ncclGinScope<mode>, cuda::memory_order_relaxed>(
+          submitted_count_ptr, (uint64_t)pending);
+      qp->sq.wq.wqes_completed = slot + 1u;   /* last rung */
+    }
+    return;
+  }
 
   /* Sliding-window SQ post with warp coalescing (Stage 2).
    *
@@ -358,7 +418,7 @@ NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, 
        * fires once. absSrcAddr/absDstAddr/writeBytes already point at the
        * payload or the scratch region per the hasPayload branch above. */
       postRdmaWrite<mode>(main_ep, main_ah, main_qpn, main_qkey, absSrcAddr, srcLkey,
-                          writeBytes, absDstAddr, dstRkey);
+                          writeBytes, absDstAddr, dstRkey, optFlags);
 
       /* Remaining (signalCount - 1) signal increments: 0-byte writes to
        * the peer scratch region on the DATA endpoint, so the caller's
@@ -369,7 +429,7 @@ NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, 
         postRdmaWrite<mode>(&dev->data, dataSigAh, dataSigQpn, dataSigQkey,
                             dev->scratch_local_addr, dev->scratch_lkey, 0u,
                             dev->scratch_remote_addrs[peer],
-                            dev->scratch_remote_rkeys[peer]);
+                            dev->scratch_remote_rkeys[peer], optFlags);
       }
     }
   }
@@ -391,6 +451,12 @@ NCCL_DEVICE_INLINE static void putImpl(ncclGinCtx ctx, Coop coop, int peer, bool
                                     cuda::thread_scope required, cuda::thread_scope given,
                                     uint32_t optFlags) {
   switch ((ncclGinResourceSharingMode)ctx.resourceSharingMode) {
+    case NCCL_GIN_RESOURCE_SHARING_THREAD:
+      putImplMode<NCCL_GIN_RESOURCE_SHARING_THREAD>(
+        ctx, coop, peer, hasWins, dstWin, dstOff, srcWin, srcOff, bytes,
+        signal, signalOp, signalOpArg, hasCounter, counterId,
+        hasDescriptor, descriptor, required, given, optFlags);
+      break;
     case NCCL_GIN_RESOURCE_SHARING_CTA:
       putImplMode<NCCL_GIN_RESOURCE_SHARING_CTA>(
         ctx, coop, peer, hasWins, dstWin, dstOff, srcWin, srcOff, bytes,
@@ -414,6 +480,30 @@ NCCL_DEVICE_INLINE static void flushImplMode(ncclGinCtx ctx, Coop coop, cuda::me
   coop.sync();
   if (coop.thread_rank() == 0) {
     nccl_ofi_gin_gdaki_dev_handle *dev = getDevHandle(ctx);
+
+    /* THREAD mode may have deferred doorbells (aggregated posts). Ring any
+     * pending batch on each local poster QP before waiting, so the NIC can
+     * make progress. Single writer, so pc/wqes_completed are race-free.
+     * Advancing submitted_count by the pending count keeps the drain wait
+     * below exact. */
+    if (mode == NCCL_GIN_RESOURCE_SHARING_THREAD) {
+      auto ring_pending = [](nccl_ofi_gin_gdaki_dev_endpoint_handle &ep) {
+        efa_cuda_qp *qp = (efa_cuda_qp *)ep.qp;
+        uint32_t pending = qp->sq.wq.pc - qp->sq.wq.wqes_completed;
+        if (pending != 0u) {
+          __threadfence_system();   /* WQEs visible before the doorbell */
+          *qp->sq.wq.db = qp->sq.wq.pc;
+          __threadfence_system();
+          scopedAtomicAdd<ncclGinScope<mode>, cuda::memory_order_relaxed>(
+              &ep.submitted_count, (uint64_t)pending);
+          qp->sq.wq.wqes_completed = qp->sq.wq.pc;
+        }
+      };
+      ring_pending(dev->data);
+      for (int i = 0; i < dev->nCounters; i++) {
+        ring_pending(dev->counter_handles[i]->base);
+      }
+    }
 
     /* For each endpoint with outstanding work, snapshot submitted_count
      * (scoped atomic load matching the relaxed bumps from the post
@@ -455,6 +545,9 @@ NCCL_DEVICE_INLINE static void flushImplMode(ncclGinCtx ctx, Coop coop, cuda::me
 template <typename Coop>
 NCCL_DEVICE_INLINE static void flushImpl(ncclGinCtx ctx, Coop coop, cuda::memory_order ord, uint32_t* abortFlag) {
   switch ((ncclGinResourceSharingMode)ctx.resourceSharingMode) {
+    case NCCL_GIN_RESOURCE_SHARING_THREAD:
+      flushImplMode<NCCL_GIN_RESOURCE_SHARING_THREAD>(ctx, coop, ord, abortFlag);
+      break;
     case NCCL_GIN_RESOURCE_SHARING_CTA:
       flushImplMode<NCCL_GIN_RESOURCE_SHARING_CTA>(ctx, coop, ord, abortFlag);
       break;
