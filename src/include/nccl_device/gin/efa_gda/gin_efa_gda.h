@@ -255,35 +255,46 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(
       while (((chunk_next - (uint32_t)hwCounterLoad(local_cntr_ptr)) & EFA_CNTR_MASK) > sq_size_val) {
         /* spin */
       }
+      /* Turn-wait BEFORE writing: only the reservation turn-holder
+       * (base_ref == chunk_base) may write its WQE. This puts WQE writes in
+       * strict slot order across groups, which the NIC requires — parallel
+       * writes ahead of the turn corrupt reused slots at the ring wrap and
+       * stall the NIC on the tail WQE. */
+      while (base_ref.load(cuda::memory_order_acquire) != chunk_base) {
+        /* spin: take the turn before writing */
+      }
     }
-    group.sync();   /* members wait for leader's backpressure before writing */
+    group.sync();   /* members wait for leader's backpressure + turn before writing */
 
-    /* Members in this window write their own WQE into their slot. */
-    if (my_idx >= chunk_start && my_idx < chunk_start + chunk_size) {
-      uint32_t my_slot = chunk_base + (uint32_t)(my_idx - chunk_start);
-      uint32_t sq_idx  = my_slot & qp->sq.wq.queue_mask;
-      int wqe_phase    = (int)((my_slot >> qp->sq.wq.queue_size_shift) & 1u);
-      EFA_SET(&wr.meta.ctrl2, EFA_IO_TX_META_DESC_PHASE, wqe_phase);
-      uint64_t *src = (uint64_t *)&wr;
-      uint64_t *dst = (uint64_t *)(qp->sq.wq.buf + sq_idx * sizeof(efa_io_tx_wqe));
-      for (int i = 0; i < 8; i++)
-        dst[i] = src[i];
+    /* Members in this window write their own WQE into their slot, one at a
+     * time in strict slot order (each fenced to system scope). Both the
+     * serialization AND the fence are needed: without the fence, hardware
+     * write-combining/reordering between GPU and NIC can land the writes
+     * out of order at the NIC; without the serialization (parallel writes),
+     * different lanes' fences don't order writes across lanes. Together
+     * they ensure the NIC sees WQEs arrive in slot order. */
+    for (int k = chunk_start; k < chunk_start + chunk_size; k++) {
+      if (my_idx == k) {
+        uint32_t my_slot = chunk_base + (uint32_t)(my_idx - chunk_start);
+        uint32_t sq_idx  = my_slot & qp->sq.wq.queue_mask;
+        int wqe_phase    = (int)((my_slot >> qp->sq.wq.queue_size_shift) & 1u);
+        EFA_SET(&wr.meta.ctrl2, EFA_IO_TX_META_DESC_PHASE, wqe_phase);
+        uint64_t *src = (uint64_t *)&wr;
+        uint64_t *dst = (uint64_t *)(qp->sq.wq.buf + sq_idx * sizeof(efa_io_tx_wqe));
+        for (int i = 0; i < 8; i++)
+          dst[i] = src[i];
+        __threadfence_system();   /* publish this WQE before the next member writes */
+      }
+      group.sync();
     }
-    group.sync();   /* all members' WQE writes for this chunk are done */
 
     if (is_leader) {
-      /* Publish this group's WQE writes to system scope before handing off,
-       * so they are visible to the NIC whenever any doorbell (this group's or
-       * a later draining group's) rings a slot in this range.
-       * Each group must publish its own writes: __threadfence_system()
-       * orders only the calling thread's writes, and the handoff (base_ref)
-       * is device/block scope, so a later thread's fence cannot publish this
-       * group's writes for it. Runs on both the ring and the defer path. */
-      __threadfence_system();
-      /* Doorbell-order rendezvous: take the turn in strict slot order. */
-      while (base_ref.load(cuda::memory_order_acquire) != chunk_base) {
-        /* spin */
-      }
+      /* Turn already held (taken before the WQE writes above). Each member
+       * fenced its own WQE write to system scope inside the per-WQE loop,
+       * and the trailing group.sync() ensures all those fences retired
+       * before we get here — so the WQEs are already system-visible to the
+       * NIC. No leader fence needed before ringDoorbell (its own fence
+       * covers the doorbell MMIO write). */
 
       /* Ring unless aggregating. Force a ring if deferring would leave
        * more than max_batch un-rung WQEs (db_rung is the last rung slot),
@@ -516,7 +527,7 @@ NCCL_DEVICE_INLINE static void flushImplMode(ncclGinCtx ctx, Coop coop, cuda::me
 
       /* Drain-to-zero: outstanding = (submitted - completed) reduced to
        * 31 bits, since the NIC FI_WRITE counter wraps at 2^31. Wait until
-       * no work is outstanding. Outstanding is bounded by sq_size « 2^31,
+       * no work is outstanding. Outstanding is bounded by sq_size << 2^31,
        * so the masked difference is exact and cannot be fooled by a
        * counter wrap. */
       while (((((uint32_t)target) - (uint32_t)hwCounterLoad(ep.local_cntr_value)) & EFA_CNTR_MASK) != 0) {
@@ -525,7 +536,11 @@ NCCL_DEVICE_INLINE static void flushImplMode(ncclGinCtx ctx, Coop coop, cuda::me
       return true;
     };
 
-    if (!wait_for_endpoint(dev->data)) return;
+    /* Fall through to the trailing coop.sync() even on abort (do NOT early
+     * return): non-leader lanes wait at the barrier, so if the leader
+     * returns from wait_for_endpoint via abortFlag it must still reach
+     * coop.sync() to avoid a warp/CTA-barrier deadlock. */
+    bool ok = wait_for_endpoint(dev->data);
 
     /* Drain the counter endpoints only. With the decoupled model the
      * local poster QP is always either the data endpoint or a counter
@@ -533,9 +548,10 @@ NCCL_DEVICE_INLINE static void flushImplMode(ncclGinCtx ctx, Coop coop, cuda::me
      * only ever a remote TARGET, never a local poster, so its FI_WRITE
      * counter never ticks from our writes and there is nothing to
      * drain. A signal QP needs no local completions at all. */
-    for (int i = 0; i < dev->nCounters; i++) {
-      if (!wait_for_endpoint(dev->counter_handles[i]->base)) return;
+    for (int i = 0; ok && i < dev->nCounters; i++) {
+      ok = wait_for_endpoint(dev->counter_handles[i]->base);
     }
+    (void)ok;
   }
   coop.sync();
 }
