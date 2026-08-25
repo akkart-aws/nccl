@@ -9,9 +9,43 @@
  *
  * Implemented: Put (data + signal/counter endpoints, signal-only via
  *              scratch buffer), PutValue (value staged through the
- *              per-endpoint slot pool), Flush, GetSignalPtr,
- *              GetCounterPtr, ResetSignal, ResetCounter.
- * Stub: Get, FlushAsync, Wait.
+ *              per-endpoint slot pool), Flush, FlushAsync, Wait,
+ *              GetSignalPtr, GetCounterPtr, ResetSignal, ResetCounter.
+ * Stub: Get.
+ *
+ * COMPLETION
+ * ----------
+ * Every write is posted with COMP_REQ = 1, so the NIC writes one CQE per write
+ * and increments the posting endpoint's FI_WRITE hardware counter. Completion is
+ * read three ways:
+ *
+ *   *ep->completed_count    per-QP completion: the endpoint's FI_WRITE NIC
+ *                     counter, read directly from GPU memory by the SQ-overflow
+ *                     backpressure spin and the blocking Flush. Wraps at 2^31, so
+ *                     compared under EFA_CNTR_MASK.
+ *   *dev->completed_count_per_ctx  count of CQEs the host has drained from the
+ *                     shared CQ, host-published via gdrcopy. Read by the
+ *                     per-context CQ-overflow gate in postRdmaWrite.
+ *   dev->peer_completion[peer]     {ordered_completed_count_per_peer, error_at}:
+ *                     a contiguous prefix in that peer's own posting sequence,
+ *                     derived from the shared CQ and host-published via gdrcopy.
+ *                     Read by FlushAsync/Wait and put's signal-ordering wait.
+ *
+ * The per-context and per-peer counts come from a host thread (the plugin's CQ
+ * progress pass, driven by NCCL's GIN progress thread) that drains the context's
+ * shared CQ. Each WQE stamps req_id with a (peer, pseq) split (peer in the high
+ * bits, pseq in the low NCCL_OFI_GDAKI_PSEQ_BITS bits), echoed by
+ * efa_io_cdesc_common::req_id, so the host reads peer and pseq from the CQE.
+ *
+ * The per-peer count is a contiguous prefix rather than a bare count, because EFA
+ * SRD completes out of order even to one peer: only "everything below N completed"
+ * proves a particular earlier write finished. Only a contiguous prefix expresses
+ * that, which is why the host derives per-peer from the CQ while per-QP stays the
+ * NIC counter.
+ *
+ * The FI_REMOTE_WRITE hardware counter is used for signal delivery; the FI_WRITE
+ * counter also backs the user-facing GIN counter value.
+ *
  *************************************************************************/
 
 #ifndef _NCCL_DEVICE_GIN_EFA_GDA_H_
@@ -26,6 +60,24 @@
 
 /* efa-dp-direct device functions (inline implementations) */
 #include "../../transport/net_efa_gda/efa-dp-direct/include/device/efa_cuda_dp_impl.cuh"
+
+/* This request carries what FlushAsync hands to Wait: a peer and a snapshot of
+ * that peer's submitted count.
+ *
+ * submitted_count_at_flush is ctx->submitted_count_per_peer[peer] read at the
+ * moment of the call: how many writes this CONTEXT had doorbelled to that peer,
+ * across every QP. FlushAsync copies the value rather than re-reading the counter
+ * later, because the counter keeps growing as more puts happen; copying it both
+ * excludes puts issued after the flushAsync (the contract) and guarantees the
+ * wait terminates. Wait compares the copy against the host-published per-peer
+ * ordered prefix, so one number suffices. */
+struct ncclGinEfaGdaRequest {
+  uint32_t peer;
+  uint32_t submitted_count_at_flush;
+  uint64_t reserved;
+};
+static_assert(sizeof(ncclGinEfaGdaRequest) <= sizeof(ncclGinRequest_t),
+              "ncclGinEfaGdaRequest must fit in ncclGinRequest_t");
 
 namespace nccl {
 namespace gin {
@@ -55,24 +107,46 @@ static constexpr cuda::thread_scope ncclGinScope =
 static constexpr uint32_t EFA_CNTR_MASK = 0x7fffffffu;
 
 /* Hardware cap on a single RDMA write: efadv_device_attr.max_rdma_size,
- * 1 GiB on current EFA devices. A WQE exceeding it fails on the NIC as a CQ
- * error, which this CQ-less path never observes, so the put hangs; the u32
- * SGE length field additionally truncates sizes >= 4 GiB. Larger puts are
- * split into chunks of at most this size in putImplMode. */
+ * 1 GiB on current EFA devices. A WQE exceeding it fails on the NIC as a
+ * completion error; the u32 SGE length field additionally truncates sizes
+ * >= 4 GiB. Larger puts are split into chunks of at most this size in
+ * putImplMode. */
 static constexpr uint32_t EFA_GDA_MAX_WRITE_SIZE = 1u << 30;
+
+/* req_id is the field the EFA completion echoes back (efa_io_cdesc_common), and it
+ * carries a write's attribution: the peer in the high EFA_GDA_PEER_BITS, and the
+ * write's position in that peer's posting sequence (pseq) in the low
+ * EFA_GDA_PSEQ_BITS. The split must match NCCL_OFI_GDAKI_PSEQ_BITS in the plugin,
+ * which sizes the host's per-peer completion bitmap from the same number, and it
+ * caps the ranks this backend can address at 2^EFA_GDA_PEER_BITS. The assert below
+ * pins the two widths to the field they divide, so widening one without narrowing
+ * the other fails the build instead of silently aliasing peers or pseqs. */
+static constexpr uint32_t EFA_GDA_PSEQ_BITS = 8;
+static constexpr uint32_t EFA_GDA_PEER_BITS = 8;
+static constexpr uint64_t EFA_GDA_PSEQ_MASK = (1ull << EFA_GDA_PSEQ_BITS) - 1ull;
+static constexpr uint64_t EFA_GDA_PEER_MASK = (1ull << EFA_GDA_PEER_BITS) - 1ull;
+static_assert(EFA_GDA_PEER_BITS + EFA_GDA_PSEQ_BITS ==
+                sizeof(decltype(efa_io_tx_meta_desc::req_id)) * 8,
+              "req_id must be split entirely between its peer and pseq fields");
 
 /* ── Atomic primitives parameterized on scope and memory order ────── */
 
-template <cuda::thread_scope Scope, cuda::memory_order Order>
-NCCL_DEVICE_INLINE static uint64_t scopedAtomicLoad(uint64_t* ptr) {
-  cuda::atomic_ref<uint64_t, Scope> r(*ptr);
+template <cuda::thread_scope Scope, cuda::memory_order Order, typename T>
+NCCL_DEVICE_INLINE static T scopedAtomicLoad(T* ptr) {
+  cuda::atomic_ref<T, Scope> r(*ptr);
   return r.load(Order);
 }
 
-template <cuda::thread_scope Scope, cuda::memory_order Order>
-NCCL_DEVICE_INLINE static void scopedAtomicAdd(uint64_t* ptr, uint64_t val) {
-  cuda::atomic_ref<uint64_t, Scope> r(*ptr);
+template <cuda::thread_scope Scope, cuda::memory_order Order, typename T>
+NCCL_DEVICE_INLINE static void scopedAtomicAdd(T* ptr, T val) {
+  cuda::atomic_ref<T, Scope> r(*ptr);
   r.fetch_add(val, Order);
+}
+
+template <cuda::thread_scope Scope, cuda::memory_order Order, typename T>
+NCCL_DEVICE_INLINE static T scopedAtomicFetchAdd(T* ptr, T val) {
+  cuda::atomic_ref<T, Scope> r(*ptr);
+  return r.fetch_add(val, Order);
 }
 
 /* ── NIC-written hardware counter (FI_WRITE / FI_REMOTE_WRITE) ────── */
@@ -87,6 +161,38 @@ NCCL_DEVICE_INLINE static void scopedAtomicAdd(uint64_t* ptr, uint64_t val) {
 template <cuda::memory_order Order = cuda::memory_order_acquire>
 NCCL_DEVICE_INLINE static uint64_t hwCounterLoad(uint64_t* ptr) {
   return scopedAtomicLoad<cuda::thread_scope_system, Order>(ptr);
+}
+
+/* ── Completion state (per-QP: NIC counter; per-ctx/per-peer: CQ-derived) ─── */
+
+/* This spins until `peer`'s first `target` writes on this context have all
+ * completed. It is sound on an out-of-order transport because the ordered prefix
+ * advances only over a contiguous run: a missing earlier completion holds the
+ * ordered prefix below the target however late that completion arrives. */
+template <bool HasTimeout>
+NCCL_DEVICE_INLINE static ncclResult_t waitPeerCompleted(nccl_ofi_gin_gdaki_dev_handle* dev,
+                                                         uint32_t peer, uint32_t target,
+                                                         uint32_t* abortFlag, uint64_t startCycle,
+                                                         uint64_t timeoutCycles) {
+  /* The signed difference orders the per-peer uint32 counter correctly across its
+   * wrap at 2^32, since the true gap is bounded by what can be in flight. */
+  while ((int32_t)(scopedAtomicLoad<cuda::thread_scope_system, cuda::memory_order_acquire>(
+                     (uint32_t*)&dev->peer_completion[peer].ordered_completed_count_per_peer) -
+                   target) < 0) {
+    if NCCL_IF_CONSTEXPR (HasTimeout) {
+      if (clock64() - startCycle >= timeoutCycles) return ncclTimeout;
+    }
+    if (abortFlag && *abortFlag) return ncclInProgress;
+  }
+  /* This error check runs after the spin: failed writes still count as completed,
+   * so the loop can exit immediately, or never run, even when a covered write
+   * failed, and a post-spin check is what catches that case. error_at is biased by
+   * +1 with 0 meaning "none", so a ~0u sentinel cannot fake an error on every wait. */
+  uint32_t biasedErrorAt = scopedAtomicLoad<cuda::thread_scope_system, cuda::memory_order_relaxed>(
+    (uint32_t*)&dev->peer_completion[peer].error_at);
+  if (__builtin_expect(biasedErrorAt != 0 && (int32_t)(biasedErrorAt - target) <= 0, false))
+    return ncclSystemError;
+  return ncclSuccess;
 }
 
 /* ── ringDoorbell: shared doorbell-ring used by the post-path ring sites ─
@@ -121,7 +227,7 @@ NCCL_DEVICE_INLINE static void ringDoorbell(efa_cuda_qp* qp, uint64_t* submitted
   dbrung_ref.store(target, cuda::memory_order_release);
 }
 
-/* ── postRdmaWrite: shared post path for Put and PutValue ─────────── */
+/* ── postRdmaWrite: admission gate + shared post path for Put and PutValue ── */
 
 /* Posts an RDMA write on `ep`'s local QP (its FI_WRITE counter tracks
  * local completion) to the remote QP given by the explicit
@@ -134,29 +240,83 @@ NCCL_DEVICE_INLINE static void ringDoorbell(efa_cuda_qp* qp, uint64_t* submitted
  * dedicated PutValue endpoint (pvdata), so each lane stages its value into
  * its own pool slot at pvSliceBase + (reserved SQ slot % sq_size) *
  * pvSlotSize and points the WR's SGE there. Put (pvSrcVal == nullptr) uses
- * the caller's fixed srcAddr/srcLkey. */
+ * the caller's fixed srcAddr/srcLkey.
+ *
+ * `dev` and `peerIdx` identify the target peer: they drive req_id stamping and
+ * the per-peer and per-context backpressure and counts. */
 template <ncclGinResourceSharingMode mode>
-NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_endpoint_handle* ep, uint16_t ah, uint16_t qpn,
+NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_handle* dev,
+                                             nccl_ofi_gin_gdaki_dev_endpoint_handle* ep, uint32_t peerIdx,
+                                             uint16_t ah, uint16_t qpn,
                                              uint32_t qkey, uint64_t srcAddr, uint32_t srcLkey, uint32_t writeBytes,
                                              uint64_t dstAddr, uint32_t dstRkey,
                                              uint32_t optFlags = ncclGinOptFlagsDefault, const void* pvSrcVal = nullptr,
                                              uint32_t pvValBytes = 0, uint32_t pvLkey = 0, uint64_t pvSliceBase = 0,
                                              uint32_t pvSlotSize = 0) {
+  /* ── Admission: leader-only over contiguous per-peer blocks ──────────
+   *
+   * A write takes its position in the peer's posting sequence once, then joins the
+   * posting pass below only when that position is inside the peer's window and the
+   * shared CQ has room. The lanes converged here partition by peer, one leader per
+   * peer reserves the subgroup's block with a single atomic, and that leader alone
+   * waits until the block's top position has room. The members idle at
+   * warp-internal syncs, so the PCIe-resident counters see one reader per peer
+   * instead of one per lane.
+   *
+   * Waiting while holding a block is safe because admission happens before the
+   * posting group is formed: a waiting lane holds no doorbell turn and no SQ slot.
+   * Every position below the block's base belongs to an earlier block, groups take
+   * the doorbell in strict slot order, and the max_batch gate in the posting pass
+   * bounds the un-rung depth, so the completions a leader waits for always reach
+   * the NIC without help from any lane waiting here. This needs
+   * max_batch + 32 < peer_window, which the plugin checks at context setup. */
+  cooperative_groups::coalesced_group active = cooperative_groups::coalesced_threads();
+  auto peerGroup = cooperative_groups::labeled_partition(active, peerIdx);
+
+  uint32_t blockSize = (uint32_t)peerGroup.num_threads();
+  uint32_t blockBase = 0;
+  if (peerGroup.thread_rank() == 0) {
+    blockBase = scopedAtomicFetchAdd<ncclGinScope<mode>, cuda::memory_order_relaxed>(
+      &dev->submitted_count_per_peer[peerIdx], blockSize);
+  }
+  blockBase = peerGroup.shfl(blockBase, 0);
+  uint32_t pseq = blockBase + (uint32_t)peerGroup.thread_rank();
+
+  if (peerGroup.thread_rank() == 0) {
+    uint32_t blockTop = blockBase + blockSize - 1u;
+    /* The block has room once the peer's ordered prefix has come within
+     * peer_window of its top position, which keeps the host's per-peer
+     * completion bitmap a fixed size and every live position in it distinct.
+     * The prefix only advances, so once the block fits it keeps fitting. */
+    while ((uint32_t)(blockTop - scopedAtomicLoad<cuda::thread_scope_system, cuda::memory_order_acquire>(
+                                   (uint32_t*)&dev->peer_completion[peerIdx].ordered_completed_count_per_peer)) >=
+           dev->peer_window) {
+      /* spin */
+    }
+    /* The context's shared CQ has room while the entries the host has yet to
+     * read, plus this whole block, stay within its depth, since an overflow
+     * drops completions. Other posters keep filling the CQ, so this can turn
+     * false again and is re-read until the block posts. */
+    while ((hwCounterLoad<cuda::memory_order_relaxed>(dev->submitted_count_per_ctx) -
+            hwCounterLoad<cuda::memory_order_relaxed>(dev->completed_count_per_ctx)) +
+             (uint64_t)blockSize >
+           (uint64_t)dev->cq_depth) {
+      /* spin */
+    }
+  }
+  /* The members wait for their leader's admission here, and the peer subgroups
+   * then reconverge into the full active group, so the posting pass below still
+   * runs the warp as one group under one doorbell. */
+  peerGroup.sync();
+  active.sync();
+
+  /* ── Posting: one group per QP, one doorbell per batch ─────────────── */
   efa_cuda_qp* qp = (efa_cuda_qp*)ep->qp;
   uint64_t* submitted_count_ptr = &ep->submitted_count;
-  uint64_t* local_cntr_ptr = ep->local_cntr_value;
+  uint64_t* local_cntr_ptr = ep->completed_count;
   uint32_t sq_size_val = ep->sq_size;
 
   /* Only the SGE differs for PutValue, so set_sge is deferred. */
-  efa_io_tx_wqe wr;
-  efa_cuda_init_rdma_write_wr(&wr, (uint16_t)threadIdx.x, dstRkey, dstAddr);
-  efa_cuda_wr_set_remote(&wr, ah, (uint32_t)qpn, qkey);
-  /* Tag the WQE as PPS-sensitive. GIN puts are small, high-rate writes, so
-   * ask the NIC to optimize for packets-per-second (burst PPS) rather than
-   * bandwidth. This sets the PROCESSING_HINTS field in the WQE meta
-   * descriptor (ctrl3); it is a hint, so the device may ignore it. */
-  efa_cuda_wr_set_processing_hints(&wr, EFA_CUDA_PROCESSING_HINT_BURST_PPS_SENSITIVE);
-
   /* Sliding-window SQ post with warp coalescing (Stage 2).
    *
    * Inlines the reserve / write / doorbell sequence directly against
@@ -181,9 +341,9 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_endpoint_han
    *                    window check below (gated on db_rung), so the EFA
    *                    staging limit is always respected.
    *
-   * Coalescing: lanes of a warp targeting the same QP form a group via
-   * coalesced_threads() + labeled_partition(qp). The leader reserves g
-   * = group.num_threads() contiguous slots; every member writes its own
+   * Coalescing: the active group's lanes targeting the same QP form a
+   * group via labeled_partition(qp). The leader reserves g
+   * = qpGroup.num_threads() contiguous slots; every member writes its own
    * WQE in parallel; the leader rings one doorbell for the batch.
    *
    * max_batch bound: a group may be larger than the EFA staging limit
@@ -198,11 +358,10 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_endpoint_han
    *   - doorbell rendezvous (leader): wait until released == chunk_base
    *     (strict slot order across groups), ring the doorbell, then
    *     advance released to hand off to the next group. */
-  cooperative_groups::coalesced_group active = cooperative_groups::coalesced_threads();
-  auto group = cooperative_groups::labeled_partition(active, (unsigned long long)(uintptr_t)qp);
+  auto qpGroup = cooperative_groups::labeled_partition(active, (unsigned long long)(uintptr_t)qp);
 
-  int my_idx = group.thread_rank();
-  int group_size = group.num_threads();
+  int my_idx = qpGroup.thread_rank();
+  int group_size = qpGroup.num_threads();
   bool is_leader = (my_idx == 0);
   uint32_t max_batch = qp->sq.wq.max_batch;
 
@@ -213,12 +372,13 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_endpoint_han
   cuda::atomic_ref<uint32_t, ncclGinScope<mode>> dbrung_ref(qp->sq.wq.wqes_posted);
   const bool aggregate = (optFlags & ncclGinOptFlagsAggregateRequests) != 0;
 
+
   /* Leader reserves the whole group's contiguous slot range. */
   uint32_t base = 0;
   if (is_leader) {
     base = pc_ref.fetch_add((uint32_t)group_size, cuda::memory_order_relaxed);
   }
-  base = group.shfl(base, 0);
+  base = qpGroup.shfl(base, 0);
 
   /* Chunk the group into windows of <= max_batch. */
   for (int chunk_start = 0; chunk_start < group_size; chunk_start += (int)max_batch) {
@@ -253,6 +413,9 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_endpoint_han
           }
         }
       }
+#if 0  /* EXPERIMENT: SQ ring-overflow spin disabled. The per-peer admission
+        * windows collectively bound this QP's outstanding writes to
+        * nranks * peer_window, which fits sq_size in the current config. */
       /* SQ ring-overflow backpressure on the chunk's high-water slot.
        * Poll the NIC FI_WRITE counter with system-scope relaxed loads.
        *
@@ -266,12 +429,33 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_endpoint_han
              sq_size_val) {
         /* spin */
       }
+#endif
     }
-    group.sync();   /* members wait for leader's backpressure before writing */
+    qpGroup.sync();   /* members wait for leader's backpressure before writing */
 
     /* Members in this window write their own WQE into their slot. */
     if (my_idx >= chunk_start && my_idx < chunk_start + chunk_size) {
       uint32_t my_slot = chunk_base + (uint32_t)(my_idx - chunk_start);
+
+      /* The WQE is built here, where the write's position is known, so its req_id
+       * carries the real (peer, pseq) from the start. The EFA completion echoes
+       * req_id back (efa_io_cdesc_common), with the split matching
+       * NCCL_OFI_GDAKI_PSEQ_BITS in the plugin. pseq is the position this write
+       * reserved in that peer's own posting sequence, the same counter FlushAsync
+       * snapshots. The host reads peer and pseq from the CQE and advances that
+       * peer's ordered_completed_count_per_peer. The admission gate above admits a
+       * write only while its position is within peer_window of that prefix, so
+       * pseq uniquely identifies each live write. */
+      efa_io_tx_wqe wr;
+      const uint64_t wrReqId = (((uint64_t)peerIdx & EFA_GDA_PEER_MASK) << EFA_GDA_PSEQ_BITS) |
+                               ((uint64_t)pseq & EFA_GDA_PSEQ_MASK);
+      efa_cuda_init_rdma_write_wr(&wr, (uint16_t)wrReqId, dstRkey, dstAddr);
+      efa_cuda_wr_set_remote(&wr, ah, (uint32_t)qpn, qkey);
+      /* Tag the WQE as PPS-sensitive. GIN puts are small, high-rate writes, so
+       * ask the NIC to optimize for packets-per-second (burst PPS) rather than
+       * bandwidth. This sets the PROCESSING_HINTS field in the WQE meta
+       * descriptor (ctrl3); it is a hint, so the device may ignore it. */
+      efa_cuda_wr_set_processing_hints(&wr, EFA_CUDA_PROCESSING_HINT_BURST_PPS_SENSITIVE);
 
       uint64_t wrSrcAddr = srcAddr;
       uint32_t wrSrcLkey = srcLkey;
@@ -285,12 +469,18 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_endpoint_han
         wrSrcLkey = pvLkey;
       }
 
-      /* Only the source SGE is per-lane, the rest of wr was already built above. */
+      /* Only the source SGE depends on the PutValue staging above. */
       efa_cuda_wr_set_sge(&wr, wrSrcLkey, wrSrcAddr, writeBytes);
 
       uint32_t sq_idx = my_slot & qp->sq.wq.queue_mask;
       int wqe_phase = (int)((my_slot >> qp->sq.wq.queue_size_shift) & 1u);
       EFA_SET(&wr.meta.ctrl2, EFA_IO_TX_META_DESC_PHASE, wqe_phase);
+
+      /* The device bumps submitted_count_per_ctx once per WQE, so the host's
+       * completed_count_per_ctx (one per CQE) bounds shared-CQ occupancy. */
+      scopedAtomicAdd<ncclGinScope<mode>, cuda::memory_order_relaxed>(
+        dev->submitted_count_per_ctx, (uint64_t)1);
+
       uint64_t* src = (uint64_t*)&wr;
       uint64_t* dst = (uint64_t*)(qp->sq.wq.buf + sq_idx * sizeof(efa_io_tx_wqe));
       /* One final system-scope fence publishes the complete WQE after these
@@ -308,7 +498,7 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_endpoint_han
        * to the NIC whenever any doorbell rings a slot in this range. */
       cuda::atomic_thread_fence(cuda::memory_order_acq_rel, cuda::thread_scope_system);
     }
-    group.sync();   /* all members' WQE writes for this chunk are done */
+    qpGroup.sync();   /* all members' WQE writes for this chunk are done */
 
     if (is_leader) {
       /* Doorbell-order rendezvous: take the turn in strict slot order. */
@@ -338,9 +528,10 @@ NCCL_DEVICE_INLINE static void postRdmaWrite(nccl_ofi_gin_gdaki_dev_endpoint_han
       }
       base_ref.store(chunk_next, cuda::memory_order_release);   /* hand off to next group */
     }
-    group.sync();   /* chunk fully posted before the next chunk */
+    qpGroup.sync();   /* chunk fully posted before the next chunk */
   }
 }
+
 
 /* ── putImplMode: mode-templated Put implementation ─────────────── */
 
@@ -518,7 +709,7 @@ NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, 
         const uint16_t dQpn = dev->data.target_remote_qpns[dataIdx];
         const uint32_t dQkey = dev->data.target_qkey[dataIdx];
         for (size_t i = 0; i < nLeading; i++) {
-          postRdmaWrite<mode>(&dev->data, dAh, dQpn, dQkey, absSrcAddr + i * cap, srcLkey, (uint32_t)cap,
+          postRdmaWrite<mode>(dev, &dev->data, (uint32_t)peer, dAh, dQpn, dQkey, absSrcAddr + i * cap, srcLkey, (uint32_t)cap,
                               absDstAddr + i * cap, dstRkey, ncclGinOptFlagsDefault);
         }
         /* EFA SRD is unordered: the tail landing does not imply the leading
@@ -531,18 +722,23 @@ NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, 
          * mean the data is there and the source buffer safe to reuse.
          * A plain put announces nothing, so nothing can observe its chunks
          * out of order; the wait is deferred to the caller's later flush /
-         * signaled put / barrier. The drain is whole-endpoint (outstanding
-         * == 0, same loop as flushImplMode) and must be: the FI_WRITE
-         * counter does not attribute completions to WQEs, so a fully
-         * drained endpoint is the only state that proves THIS put's chunks
-         * completed. That is required for correct signal delivery, even
-         * though it also waits on concurrent posters' writes. */
+         * signaled put / barrier.
+         *
+         * Before posting the signaled tail, this code waits for this peer's leading
+         * chunks to complete: it snapshots this peer's submitted count (which now
+         * covers the leading chunks) and waits for the host-published per-peer
+         * ordered prefix to reach it. The snapshot is per peer, so the wait covers
+         * only traffic to this peer and stays fixed against concurrent posters. If
+         * a covered chunk failed, this code skips the signal. */
         if (isIndexed || hasCounter) {
-          cuda::atomic_ref<uint64_t, ncclGinScope<mode>> submitted_ref(dev->data.submitted_count);
-          while (((((uint32_t)submitted_ref.load(cuda::memory_order_relaxed)) -
-                   (uint32_t)hwCounterLoad(dev->data.local_cntr_value)) &
-                  EFA_CNTR_MASK) != 0) {
-            /* spin: leading chunks in flight */
+          uint32_t target = scopedAtomicLoad<cuda::thread_scope_system, cuda::memory_order_acquire>(
+            &dev->submitted_count_per_peer[peer]);
+          if (waitPeerCompleted</*HasTimeout=*/false>(dev, (uint32_t)peer, target, nullptr, 0, 0) !=
+              ncclSuccess) {
+            /* A covered chunk failed on the NIC. put() lacks a return channel, so
+             * this code returns before posting the signal; the signal fires only
+             * once the data is in place. */
+            return;
           }
         }
         absSrcAddr += nLeading * cap;
@@ -556,8 +752,8 @@ NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, 
        * addressed to the resolved target so the receiver's FI_REMOTE_WRITE
        * fires once. absSrcAddr/absDstAddr/writeBytes already point at the
        * payload or the scratch region per the hasPayload branch above. */
-      postRdmaWrite<mode>(main_ep, main_ah, main_qpn, main_qkey, absSrcAddr, srcLkey, writeBytes, absDstAddr, dstRkey,
-                          optFlags);
+      postRdmaWrite<mode>(dev, main_ep, (uint32_t)peer, main_ah, main_qpn, main_qkey, absSrcAddr, srcLkey, writeBytes, absDstAddr,
+                          dstRkey, optFlags);
 
       /* Remaining (signalCount - 1) signal increments: 0-byte writes to
        * the peer scratch region on the DATA endpoint, so the caller's
@@ -565,8 +761,9 @@ NCCL_DEVICE_INLINE static void putImplMode(ncclGinCtx ctx, Coop coop, int peer, 
        * signalCount > 1, which implies an INDEXED Add (and thus a
        * signal endpoint target). */
       for (uint32_t k = 1u; k < signalCount; k++) {
-        postRdmaWrite<mode>(&dev->data, dataSigAh, dataSigQpn, dataSigQkey, dev->scratch_local_addr, dev->scratch_lkey,
-                            0u, dev->scratch_remote_addrs[peer], dev->scratch_remote_rkeys[peer], optFlags);
+        postRdmaWrite<mode>(dev, &dev->data, (uint32_t)peer, dataSigAh, dataSigQpn, dataSigQkey, dev->scratch_local_addr,
+                            dev->scratch_lkey, 0u, dev->scratch_remote_addrs[peer], dev->scratch_remote_rkeys[peer],
+                            optFlags);
       }
     }
   }
@@ -653,7 +850,7 @@ NCCL_DEVICE_INLINE static void putValueImplMode(ncclGinCtx ctx, Coop coop, int p
     /* Value write: stage srcVal into pvdata's pool and RDMA-write it to the
      * destination. The arrival ticks the target sc EP's FI_REMOTE_WRITE once
      * (signalled) or no signal (no-signal). */
-    postRdmaWrite<mode>(ep, ah, qpn, qkey, /*srcAddr=*/0, /*srcLkey=*/0,
+    postRdmaWrite<mode>(dev, ep, (uint32_t)peer, ah, qpn, qkey, /*srcAddr=*/0, /*srcLkey=*/0,
                         /*writeBytes=*/(uint32_t)sizeof(T), absDstAddr, dstRkey,
                         /*optFlags=*/ncclGinOptFlagsDefault,
                         /*pvSrcVal=*/&srcVal, /*pvValBytes=*/(uint32_t)sizeof(T),
@@ -666,7 +863,7 @@ NCCL_DEVICE_INLINE static void putValueImplMode(ncclGinCtx ctx, Coop coop, int p
      * unless signalCount > 1, which implies an INDEXED Add (and thus a
      * signal endpoint target). */
     for (uint32_t k = 1u; k < signalCount; k++) {
-      postRdmaWrite<mode>(ep, ah, qpn, qkey, dev->scratch_local_addr, dev->scratch_lkey, 0u,
+      postRdmaWrite<mode>(dev, ep, (uint32_t)peer, ah, qpn, qkey, dev->scratch_local_addr, dev->scratch_lkey, 0u,
                           dev->scratch_remote_addrs[peer], dev->scratch_remote_rkeys[peer]);
     }
   }
@@ -731,7 +928,7 @@ NCCL_DEVICE_INLINE static ncclResult_t flushImplMode(ncclGinCtx ctx, Coop coop, 
        * no work is outstanding. Outstanding is bounded by sq_size « 2^31,
        * so the masked difference is exact and cannot be fooled by a
        * counter wrap. */
-      while (((((uint32_t)target_ref.load(cuda::memory_order_relaxed)) - (uint32_t)hwCounterLoad(ep.local_cntr_value)) &
+      while (((((uint32_t)target_ref.load(cuda::memory_order_relaxed)) - (uint32_t)hwCounterLoad(ep.completed_count)) &
               EFA_CNTR_MASK) != 0) {
         if NCCL_IF_CONSTEXPR (HasTimeout) {
           if (clock64() - startCycle >= timeoutCycles) return ncclTimeout;
@@ -776,6 +973,51 @@ NCCL_DEVICE_INLINE static ncclResult_t flushImpl(ncclGinCtx ctx, Coop coop, cuda
   default:
     return flushImplMode<HasTimeout, NCCL_GIN_RESOURCE_SHARING_GPU>(ctx, coop, ord, abortFlag, timeoutCycles);
   }
+}
+
+/* ── FlushAsync / Wait: one per-peer count against one published word ── */
+
+/* This snapshots into the request how much this context has doorbelled to `peer`.
+ *
+ * The acquire pairs with the release in ringDoorbell, so the snapshot includes
+ * every write doorbelled to this peer before the call and stops there; a write
+ * enters the snapshot only once its doorbell rings, which is the point it becomes
+ * in flight. */
+NCCL_DEVICE_INLINE static void flushAsyncImpl(ncclGinCtx ctx, int peer, ncclGinEfaGdaRequest* req) {
+  nccl_ofi_gin_gdaki_dev_handle* dev = getDevHandle(ctx);
+  req->peer = (uint32_t)peer;
+  req->submitted_count_at_flush = scopedAtomicLoad<cuda::thread_scope_system, cuda::memory_order_acquire>(
+    &dev->submitted_count_per_peer[peer]);
+  req->reserved = 0;
+}
+
+/* This completes the flush that FlushAsync deferred: it waits for this peer's
+ * first submitted_count_at_flush writes to complete via waitPeerCompleted, then
+ * fences at the caller's memory order so the flushed writes' effects are visible
+ * at the requested scope. A snapshot of 0 means the context doorbelled nothing to
+ * that peer. */
+template <bool HasTimeout>
+NCCL_DEVICE_INLINE static ncclResult_t waitImpl(ncclGinCtx ctx, ncclGinRequest_t& request,
+                                                cuda::memory_order ord, uint32_t* abortFlag,
+                                                uint64_t timeoutCycles) {
+  nccl_ofi_gin_gdaki_dev_handle* dev = getDevHandle(ctx);
+  ncclGinEfaGdaRequest& req = reinterpret_cast<ncclGinEfaGdaRequest&>(request);
+
+  if (req.submitted_count_at_flush == 0) return ncclSuccess;
+
+  uint64_t startCycle = 0;
+  if NCCL_IF_CONSTEXPR (HasTimeout) startCycle = clock64();
+
+  ncclResult_t result =
+    waitPeerCompleted<HasTimeout>(dev, req.peer, req.submitted_count_at_flush, abortFlag, startCycle,
+                                  timeoutCycles);
+  if (result != ncclSuccess) return result;
+
+  /* Publish the completions at the caller's chosen order, as Wait's contract
+   * requires: after this returns, the flushed writes' effects are visible at the
+   * requested scope. */
+  cuda::atomic_thread_fence(ord, cuda::thread_scope_system);
+  return ncclSuccess;
 }
 
 } // namespace efa_gda
@@ -840,44 +1082,41 @@ struct ncclGinApi_Get<NCCL_NET_DEVICE_GIN_EFA_GDA> {
 
 /* ── FlushAsync ───────────────────────────────────────────────────── */
 
+/* Delegates to flushAsyncImpl. */
 template <>
 struct ncclGinApi_FlushAsync<NCCL_NET_DEVICE_GIN_EFA_GDA> {
   NCCL_DEVICE_INLINE static void call(ncclGinCtx ctx, int peer, ncclGinRequest_t* outRequest, bool hasDescriptor,
                                       ncclGinDescriptorSmem* descriptor, uint32_t optFlags) {
-    (void)ctx;
-    (void)peer;
-    (void)outRequest;
     (void)hasDescriptor;
     (void)descriptor;
     (void)optFlags;
+    ncclGinEfaGdaRequest* req = reinterpret_cast<ncclGinEfaGdaRequest*>(outRequest);
+    nccl::gin::efa_gda::flushAsyncImpl(ctx, peer, req);
   }
 };
 
 /* ── Wait ─────────────────────────────────────────────────────────── */
 
+/* Both overloads delegate to waitImpl. */
 template <>
 struct ncclGinApi_Wait<NCCL_NET_DEVICE_GIN_EFA_GDA> {
   NCCL_DEVICE_INLINE static void call(ncclGinCtx ctx, ncclGinRequest_t& request, bool hasDescriptor,
                                       ncclGinDescriptorSmem* descriptor, cuda::memory_order ord, uint32_t* abortFlag) {
-    (void)ctx;
-    (void)request;
     (void)hasDescriptor;
     (void)descriptor;
-    (void)ord;
-    (void)abortFlag;
+    /* No return channel on this overload; a completion error is surfaced through
+     * queryLastError. */
+    (void)nccl::gin::efa_gda::waitImpl</*HasTimeout=*/false>(ctx, request, ord, abortFlag, 0);
   }
 
   NCCL_DEVICE_INLINE static ncclResult_t call(ncclGinCtx ctx, ncclGinRequest_t& request, bool hasDescriptor,
                                               ncclGinDescriptorSmem* descriptor, cuda::memory_order ord,
                                               uint32_t* abortFlag, uint64_t timeoutCycles) {
-    (void)ctx;
-    (void)request;
     (void)hasDescriptor;
     (void)descriptor;
-    (void)ord;
-    (void)abortFlag;
-    (void)timeoutCycles;
-    return ncclSuccess;
+    ncclResult_t result = nccl::gin::efa_gda::waitImpl</*HasTimeout=*/true>(ctx, request, ord, abortFlag, timeoutCycles);
+    /* Abort is a teardown signal, the same as Flush, so this reports success. */
+    return (result == ncclInProgress) ? ncclSuccess : result;
   }
 };
 
