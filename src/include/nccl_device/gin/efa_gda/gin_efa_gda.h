@@ -18,13 +18,15 @@
  * and increments the posting endpoint's FI_WRITE hardware counter. Completion is
  * read three ways:
  *
- *   *ep->local_cntr_value   per-QP completion: the endpoint's FI_WRITE NIC
- *                     counter, read directly from GPU memory by the blocking
- *                     Flush. Wraps at 2^31, so compared under EFA_CNTR_MASK.
+ *   *ep->local_cntr_value   per-QP completion: the sc endpoint's FI_WRITE NIC
+ *                     counter, read directly from GPU memory as the user-visible
+ *                     GIN counter value. Wraps at 2^31, so compared under
+ *                     EFA_CNTR_MASK.
  *   *dev->completed_count_per_ctx  count of CQEs the host has drained from the
  *                     shared CQ, host-published via gdrcopy. Read by the
  *                     per-context CQ-overflow gate in postRdmaOp, which claims its
- *                     span of submitted_count_per_ctx before waiting on it.
+ *                     span of submitted_count_per_ctx before waiting on it, and by
+ *                     the blocking Flush.
  *   dev->ordered_completed_count_per_peer[peer]:
  *                     a contiguous prefix in that peer's own posting sequence,
  *                     derived from the shared CQ and host-published via gdrcopy.
@@ -969,51 +971,38 @@ NCCL_DEVICE_INLINE static ncclResult_t flushImplMode(ncclGinCtx ctx, Coop coop, 
     if NCCL_IF_CONSTEXPR (HasTimeout) startCycle = clock64();
     else (void)startCycle; // referenced only when HasTimeout is true
 
-    /* For each endpoint with outstanding work, spin on the NIC-written
-     * FI_WRITE + FI_READ counter until it catches up with submitted_count.
-     * submitted_count is re-read (scoped relaxed atomic load matching the
-     * relaxed bumps from the post path) on every iteration rather than
-     * snapshotted once: another thread may keep posting on this context
-     * while we drain, and completions passing a stale snapshot would leave
-     * the masked difference permanently non-zero. The HW counter is read
-     * with system-scope acquire so the GPU bypasses caches and observes the
-     * latest NIC update through PCIe-coherent memory. */
-    auto wait_for_endpoint = [abortFlag, startCycle,
-                              timeoutCycles](nccl_ofi_gin_gdaki_dev_endpoint_handle& ep) -> ncclResult_t {
-      cuda::atomic_ref<uint64_t, ncclGinScope<mode>> target_ref(ep.submitted_count);
-
-      /* Drain-to-zero: outstanding = (submitted - completed) reduced to
-       * 31 bits, since the NIC FI_WRITE + FI_READ counter wraps at 2^31. Wait until
-       * no work is outstanding. Outstanding is bounded by sq_size « 2^31,
-       * so the masked difference is exact and cannot be fooled by a
-       * counter wrap. */
-      while (((((uint32_t)target_ref.load(cuda::memory_order_relaxed)) - (uint32_t)hwCounterLoad(ep.local_cntr_value)) &
-              EFA_CNTR_MASK) != 0) {
-        if NCCL_IF_CONSTEXPR (HasTimeout) {
-          if (clock64() - startCycle >= timeoutCycles) return ncclTimeout;
+    /* Drain this context by waiting for the host's count of CQEs it has read off
+     * the context's shared CQ to reach the count of writes the context has
+     * admitted. Every QP of the context binds that one CQ and every write is
+     * admitted through postRdmaOp, so this one wait covers the data endpoint, the
+     * PutValue endpoint and every sc endpoint together.
+     *
+     * Both counters are re-read on every iteration (the admitted count with a
+     * scoped relaxed load matching the relaxed bumps from the post path): another
+     * thread may keep posting on this context while we drain, and a stale target
+     * would let Flush return while those writes are still in flight. Both are
+     * 64-bit and only ever advance, so the comparison is exact.
+     *
+     * The host bumps its count for a failed CQE as well, so a failed write still
+     * releases this wait and queryLastError names the failure.
+     *
+     * The GPU reads the host's count with a system-scope acquire load, which
+     * bypasses its caches to observe the gdrcopy publication and makes the payload
+     * of the completed writes visible once Flush returns. */
+    while (scopedAtomicLoad<cuda::thread_scope_system, cuda::memory_order_acquire>(
+             dev->completed_count_per_ctx) <
+           scopedAtomicLoad<ncclGinScope<mode>, cuda::memory_order_relaxed>(
+             dev->submitted_count_per_ctx)) {
+      if NCCL_IF_CONSTEXPR (HasTimeout) {
+        if (clock64() - startCycle >= timeoutCycles) {
+          result = ncclTimeout;
+          goto done;
         }
-        if (abortFlag && *abortFlag) return ncclInProgress;
       }
-      return ncclSuccess;
-    };
-
-    result = wait_for_endpoint(dev->data);
-    if (result != ncclSuccess) goto done;
-
-    /* The dedicated PutValue endpoint is a local poster too (all PutValue
-     * writes ride it), so drain it as well. */
-    result = wait_for_endpoint(dev->pvdata);
-    if (result != ncclSuccess) goto done;
-
-    /* Drain the counter endpoints only. With the decoupled model the
-     * local poster QP is always the data endpoint, the PutValue endpoint,
-     * or a counter endpoint (counterId selects the poster); a signal
-     * endpoint is only ever a remote TARGET, never a local poster, so its
-     * FI_WRITE counter never ticks from our writes and there is nothing to
-     * drain. A signal QP needs no local completions at all. */
-    for (int i = 0; i < dev->nCounters; i++) {
-      result = wait_for_endpoint(dev->counter_handles[i]->base);
-      if (result != ncclSuccess) goto done;
+      if (abortFlag && *abortFlag) {
+        result = ncclInProgress;
+        goto done;
+      }
     }
   }
 done:

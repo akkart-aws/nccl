@@ -52,13 +52,15 @@ struct nccl_ofi_gin_gdaki_dev_endpoint_handle {
    *
    * `local_cntr_value` points at the FI_WRITE hardware counter for this
    * endpoint's QP. The NIC increments it on every locally-completed
-   * outgoing WR. The kernel reads it directly from GPU memory.
+   * outgoing WR. The kernel reads it directly from GPU memory. An sc
+   * endpoint's counter is the user-visible GIN counter value that a
+   * put carrying a counter increments.
    *
    * `submitted_count` is incremented in ringDoorbell by the group leader,
    * as an atomic add of the newly-doorbelled span.
    * (submitted_count - *local_cntr_value) gives the number of WRs still in
-   * flight on this QP — used by Flush to wait for local completion. The
-   * counter wraps at 2^31, so callers compare it under EFA_CNTR_MASK. */
+   * flight on this QP. The counter wraps at 2^31, so callers compare it
+   * under EFA_CNTR_MASK. */
   /* `local_cntr_value` is read via cuda::atomic_ref with system scope
    * (see hwCounterLoad helper) since the NIC writes it via PCIe and
    * we need to bypass GPU caches when polling. */
@@ -194,7 +196,11 @@ struct nccl_ofi_gin_gdaki_dev_handle {
    * completed_count_per_ctx is host-published, one per context: the plugin's
    *   progress pass bumps it once per entry it reads off that CQ.
    * cq_depth is the CQ's entry count. put admits a block only once its claimed span
-   *   sits within cq_depth of what the host has read. */
+   *   sits within cq_depth of what the host has read.
+   *
+   * These two counters are also the completion source for the blocking Flush, which
+   * covers every QP of the context at once because they all share the one CQ. Flush
+   * waits for completed_count_per_ctx to reach submitted_count_per_ctx. */
   uint64_t* submitted_count_per_ctx;
   uint64_t* completed_count_per_ctx;
   uint32_t cq_depth;
