@@ -100,10 +100,8 @@ NCCL_DEVICE_INLINE static uint64_t hwCounterLoad(uint64_t* ptr) {
 
 /* ── ringDoorbell: shared doorbell-ring used by the post-path ring sites ─
 
- * Rings the SQ doorbell to `target`, then advances the bookkeeping cursors:
- * submitted_count grows by the newly-rung span (target - db_rung) so Flush's
- * completion wait is exact, and db_rung (wqes_posted) is published to record
- * how far the doorbell has been rung.
+ * Rings the SQ doorbell to `target`, then publishes db_rung (wqes_posted) to
+ * record how far the doorbell has been rung.
  *
  * Preconditions the caller must satisfy:
  *   - The caller is allowed to ring up to `target` (it holds the doorbell
@@ -118,15 +116,13 @@ NCCL_DEVICE_INLINE static uint64_t hwCounterLoad(uint64_t* ptr) {
  * orders only the calling thread's own writes, and the WQEs being rung were
  * written by other threads. */
 template <ncclGinResourceSharingMode mode>
-NCCL_DEVICE_INLINE static void ringDoorbell(efa_cuda_qp* qp, uint64_t* submitted_count_ptr,
-                                            cuda::atomic_ref<uint32_t, ncclGinScope<mode>>& dbrung_ref,
-                                            uint32_t db_rung, uint32_t target) {
+NCCL_DEVICE_INLINE static void ringDoorbell(efa_cuda_qp* qp, cuda::atomic_ref<uint32_t, ncclGinScope<mode>>& dbrung_ref,
+                                            uint32_t target) {
   uint64_t dbAddr = (uint64_t)__cvta_generic_to_global(qp->sq.wq.db);
   asm volatile("st.mmio.relaxed.sys.global.b32 [%0], %1;" : : "l"(dbAddr), "r"(target) : "memory");
   /* Order the doorbell MMIO write. Use acq_rel (MEMBAR.ALL.SYS) instead of
    * __threadfence_system (MEMBAR.SC.SYS). */
   cuda::atomic_thread_fence(cuda::memory_order_acq_rel, cuda::thread_scope_system);
-  scopedAtomicAdd<ncclGinScope<mode>, cuda::memory_order_relaxed>(submitted_count_ptr, (uint64_t)(target - db_rung));
   dbrung_ref.store(target, cuda::memory_order_release);
 }
 
@@ -179,6 +175,9 @@ NCCL_DEVICE_INLINE static void postPutThread(nccl_ofi_gin_gdaki_dev_endpoint_han
     asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(done) : "l"(cntr));
   } while (((next - (uint32_t)done) & EFA_CNTR_MASK) > ep->sq_size);
   qp->sq.wq.pc = next;
+  /* The reserved slot is counted into submitted_count, which the flush drain
+   * waits on. */
+  ep->submitted_count += 1u;
 
   const uint32_t sq_idx = slot & qp->sq.wq.queue_mask;
   const uint32_t phase = (slot >> qp->sq.wq.queue_size_shift) & 1u;
@@ -201,7 +200,6 @@ NCCL_DEVICE_INLINE static void postPutThread(nccl_ofi_gin_gdaki_dev_endpoint_han
                  :
                  : "l"((uint64_t)__cvta_generic_to_global(qp->sq.wq.db)), "r"(next)
                  : "memory");
-    ep->submitted_count += (uint64_t)(next - qp->sq.wq.wqes_posted);
     qp->sq.wq.wqes_posted = next;
   }
 }
@@ -266,11 +264,14 @@ NCCL_DEVICE_INLINE static void postRdmaOpImpl(PostRdmaOpModeTag<false>, nccl_ofi
   /* Sliding-window SQ post with warp coalescing (Stage 2).
    *
    * Inlines the reserve / write / doorbell sequence directly against
-   * the efa_cuda_qp ring. Two shared cursors in the QP coordinate all
-   * posters (across lanes, warps and CTAs):
+   * the efa_cuda_qp ring. Three shared cursors in the QP coordinate all
+   * posters (across lanes, warps and CTAs), plus one count on the endpoint:
    *
    *   pc             : monotonic reservation index. A group's leader
    *                    claims its whole range with one atomicAdd(+g).
+   *   submitted_count: 64-bit count of reserved slots, on the endpoint. The
+   *                    leader bumps it beside the pc reservation, so it keeps
+   *                    step with pc. The flush drain waits on it.
    *   wqes_completed : "released" cursor — the rendezvous/handoff token.
    *                    Advances when a group passes the doorbell turn,
    *                    whether or not it actually rang (so deferred
@@ -319,10 +320,14 @@ NCCL_DEVICE_INLINE static void postRdmaOpImpl(PostRdmaOpModeTag<false>, nccl_ofi
   cuda::atomic_ref<uint32_t, ncclGinScope<mode>> dbrung_ref(qp->sq.wq.wqes_posted);
   const bool aggregate = (optFlags & ncclGinOptFlagsAggregateRequests) != 0;
 
-  /* Leader reserves the whole group's contiguous slot range. */
+  /* The leader reserves the whole group's contiguous slot range and counts the
+   * reservation into submitted_count, so the flush drain covers every reserved
+   * WQE, including those whose doorbell ncclGinOptFlagsAggregateRequests
+   * defers. */
   uint32_t base = 0;
   if (is_leader) {
     base = pc_ref.fetch_add((uint32_t)group_size, cuda::memory_order_relaxed);
+    scopedAtomicAdd<ncclGinScope<mode>, cuda::memory_order_relaxed>(submitted_count_ptr, (uint64_t)group_size);
   }
   base = group.shfl(base, 0);
 
@@ -355,7 +360,7 @@ NCCL_DEVICE_INLINE static void postRdmaOpImpl(PostRdmaOpModeTag<false>, nccl_ofi
         if (base_ref.load(cuda::memory_order_acquire) == chunk_base) {
           uint32_t db_rung = dbrung_ref.load(cuda::memory_order_relaxed);
           if (chunk_base != db_rung) {   /* deferred, already-written batch */
-            ringDoorbell<mode>(qp, submitted_count_ptr, dbrung_ref, db_rung, chunk_base);
+            ringDoorbell<mode>(qp, dbrung_ref, chunk_base);
           }
         }
       }
@@ -414,11 +419,11 @@ NCCL_DEVICE_INLINE static void postRdmaOpImpl(PostRdmaOpModeTag<false>, nccl_ofi
        * so the EFA staging limit is never exceeded. When we do ring, ring
        * to chunk_next: it is >= every deferred slot below us (we hold the
        * turn in slot order), so one doorbell drains the whole contiguous
-       * batch. submitted_count advances by everything since db_rung. */
+       * batch. */
       uint32_t db_rung = dbrung_ref.load(cuda::memory_order_relaxed);
       bool must_ring = (!aggregate) || (chunk_next - db_rung >= max_batch);
       if (must_ring) {
-        ringDoorbell<mode>(qp, submitted_count_ptr, dbrung_ref, db_rung, chunk_next);
+        ringDoorbell<mode>(qp, dbrung_ref, chunk_next);
       } else {
         /* Publish this group's WQE writes to system scope before handing off,
          * so they are visible to the NIC whenever any doorbell (this group's or
